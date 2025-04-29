@@ -324,6 +324,194 @@ void gpu_reduction_ver4(const std::vector<int>& h_data) {
 
 }
 
+// CUDA reduction version #5: unroll the last warp to remove __syncthreads
+// volatile ensures correct memory order (prevent compiler from reorder instructions when reading/writing sdata)  
+__device__ void warpReduce(volatile int* sdata, int tid) {
+  sdata[tid] += sdata[tid + 32];
+  sdata[tid] += sdata[tid + 16];
+  sdata[tid] += sdata[tid + 8];
+  sdata[tid] += sdata[tid + 4];
+  sdata[tid] += sdata[tid + 2];
+  sdata[tid] += sdata[tid + 1];
+}
+
+__global__ void reduce5(int *g_idata, int *g_odata, int N) {
+  
+  extern __shared__ int sdata[];
+
+  // perform first level of reduction by loading two element from global memory 
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x; // ×2
+  if (i < N) {
+    sdata[tid] = g_idata[i] + ((i + blockDim.x) < N ? g_idata[i + blockDim.x] : 0);
+  } else {
+    sdata[tid] = 0;
+  }
+  __syncthreads();
+
+  // do reduction in shared memory
+  // s is stride, saying the distance between the elements one thread handles
+  for(unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
+    if(tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+  }
+
+  if(tid < 32) warpReduce(sdata, tid);
+
+  // write result for this block to global memory
+  if(tid == 0) {
+    g_odata[blockIdx.x] = sdata[0];
+  }
+
+}
+
+void gpu_reduction_ver5(const std::vector<int>& h_data) {
+
+  const int N = h_data.size();
+
+  int *g_idata, *g_odata;
+  CUDACHECK(cudaMalloc(&g_idata, sizeof(int) * N));
+  // g_odata's size needs to be at least (N + BLOCK_SIZE - 1) / BLOCK_SIZE)
+  // to store the partial sums from the first step
+  CUDACHECK(cudaMalloc(&g_odata, sizeof(int) * ((N + BLOCK_SIZE - 1) / BLOCK_SIZE)));
+  CUDACHECK(cudaMemcpyAsync(g_idata, h_data.data(), sizeof(int) * N, cudaMemcpyHostToDevice));
+
+  // recursively invoke kernel
+  int num_element_left = N;
+  int *input = g_idata;
+  int *output = g_odata;
+
+  auto start = std::chrono::high_resolution_clock::now();
+  while(num_element_left > 1) {
+    // halve the number of blocks launched
+    // this is done by saying now one block can handle the work that is originally handled by two blocks in #3
+    int grid_size = (num_element_left + (BLOCK_SIZE * 2 - 1)) / (BLOCK_SIZE * 2);; 
+    reduce5<<<grid_size, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(input, output, num_element_left);
+
+    num_element_left = grid_size;
+    int *temp = input;
+    input = output;
+    output = temp;
+  }
+  cudaDeviceSynchronize();
+  auto end = std::chrono::high_resolution_clock::now();
+  std::cout << "gpu runtime (ver5, no memcpy): " << std::chrono::duration_cast<std::chrono::microseconds>(end-start).count() << " us\n";
+
+  int gpu_sum = 0;
+  CUDACHECK(cudaMemcpyAsync(&gpu_sum, input, sizeof(int), cudaMemcpyDeviceToHost));
+  std::cout << "gpu (ver5) sum: " << gpu_sum << "\n";
+
+  CUDACHECK(cudaFree(g_idata));
+  CUDACHECK(cudaFree(g_odata));
+
+}
+
+// CUDA reduction version #6: completely unroll for different block size
+template <unsigned int blockSize>
+__device__ void warpReduce1(volatile int* sdata, int tid) {
+  if(blockSize >= 64) sdata[tid] += sdata[tid + 32];
+  if(blockSize >= 32) sdata[tid] += sdata[tid + 16];
+  if(blockSize >= 16) sdata[tid] += sdata[tid + 8];
+  if(blockSize >= 8) sdata[tid] += sdata[tid + 4];
+  if(blockSize >= 4) sdata[tid] += sdata[tid + 2];
+  if(blockSize >= 2) sdata[tid] += sdata[tid + 1];
+}
+
+template <unsigned int blockSize>
+__global__ void reduce6(int *g_idata, int *g_odata, int N) {
+  
+  extern __shared__ int sdata[];
+
+  // perform first level of reduction by loading two element from global memory 
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x; // ×2
+  if (i < N) {
+    sdata[tid] = g_idata[i] + ((i + blockDim.x) < N ? g_idata[i + blockDim.x] : 0);
+  } else {
+    sdata[tid] = 0;
+  }
+  __syncthreads();
+
+  // do reduction in shared memory
+  // s is stride, saying the distance between the elements one thread handles
+  if(blockSize >= 512) {
+    if (tid < 256) {
+      sdata[tid] += sdata[tid + 256];
+    }
+    __syncthreads();
+  }
+  if(blockSize >= 256) {
+    if (tid < 128) {
+      sdata[tid] += sdata[tid + 128];
+    }
+    __syncthreads();
+  }
+  if(blockSize >= 128) {
+    if (tid < 64) {
+      sdata[tid] += sdata[tid + 64];
+    }
+    __syncthreads();
+  }
+
+  if(tid < 32) warpReduce1<blockSize>(sdata, tid);
+
+  // write result for this block to global memory
+  if(tid == 0) {
+    g_odata[blockIdx.x] = sdata[0];
+  }
+
+}
+
+void gpu_reduction_ver6(const std::vector<int>& h_data) {
+
+  const int N = h_data.size();
+
+  int *g_idata, *g_odata;
+  CUDACHECK(cudaMalloc(&g_idata, sizeof(int) * N));
+  // g_odata's size needs to be at least (N + BLOCK_SIZE - 1) / BLOCK_SIZE)
+  // to store the partial sums from the first step
+  CUDACHECK(cudaMalloc(&g_odata, sizeof(int) * ((N + BLOCK_SIZE - 1) / BLOCK_SIZE)));
+  CUDACHECK(cudaMemcpyAsync(g_idata, h_data.data(), sizeof(int) * N, cudaMemcpyHostToDevice));
+
+  // recursively invoke kernel
+  int num_element_left = N;
+  int *input = g_idata;
+  int *output = g_odata;
+
+  auto start = std::chrono::high_resolution_clock::now();
+  while(num_element_left > 1) {
+    // halve the number of blocks launched
+    // this is done by saying now one block can handle the work that is originally handled by two blocks in #3
+    int grid_size = (num_element_left + (BLOCK_SIZE * 2 - 1)) / (BLOCK_SIZE * 2);; 
+    switch(BLOCK_SIZE) {
+      case 512:
+        reduce6<512><<<grid_size, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(input, output, num_element_left);
+      case 256:
+        reduce6<256><<<grid_size, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(input, output, num_element_left);
+      case 128:
+        reduce6<128><<<grid_size, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(input, output, num_element_left);
+    }
+
+    num_element_left = grid_size;
+    int *temp = input;
+    input = output;
+    output = temp;
+  }
+  cudaDeviceSynchronize();
+  auto end = std::chrono::high_resolution_clock::now();
+  std::cout << "gpu runtime (ver6, no memcpy): " << std::chrono::duration_cast<std::chrono::microseconds>(end-start).count() << " us\n";
+
+  int gpu_sum = 0;
+  CUDACHECK(cudaMemcpyAsync(&gpu_sum, input, sizeof(int), cudaMemcpyDeviceToHost));
+  std::cout << "gpu (ver6) sum: " << gpu_sum << "\n";
+
+  CUDACHECK(cudaFree(g_idata));
+  CUDACHECK(cudaFree(g_odata));
+
+}
+
 int main() {
     size_t step_size = 30;
     const int N = 1 << step_size; // 1M elements
@@ -346,6 +534,16 @@ int main() {
     // GPU reduction with sequential addressing to remove bank conflict
     // perform add during shared memory load
     gpu_reduction_ver4(h_data);
+
+    // GPU reduction with sequential addressing to remove bank conflict
+    // perform add during shared memory load
+    // remove syncthread by unroll for loop in the last 6 iteration
+    gpu_reduction_ver5(h_data);
+
+    // GPU reduction with sequential addressing to remove bank conflict
+    // perform add during shared memory load
+    // completely unroll for loop 
+    gpu_reduction_ver6(h_data);
 
     return 0;
 }
