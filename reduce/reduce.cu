@@ -1,70 +1,311 @@
-// reduction.cu
+// reduce.cu
 #include <iostream>
 #include <vector>
 #include <numeric>
 #include <omp.h>
+#include <chrono>
 
-__global__ void cuda_reduction(int *input, int *output, int N) {
-    extern __shared__ int sdata[];
+#define BLOCK_SIZE 128 
 
-    unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+// handle errors in CUDA call
+#define CUDACHECK(call)                                                        \
+{                                                                          \
+   const cudaError_t error = call;                                         \
+   if (error != cudaSuccess)                                               \
+   {                                                                       \
+      printf("Error: %s:%d, ", __FILE__, __LINE__);                        \
+      printf("code:%d, reason: %s\n", error, cudaGetErrorString(error));   \
+      exit(1);                                                             \
+   }                                                                       \
+} (void)0  // Ensures a semicolon is required after the macro call.
 
-    // Load input into shared memory
-    sdata[tid] = (i < N) ? input[i] : 0;
-    __syncthreads();
-
-    // Do reduction in shared memory
-    for (unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    // Write result for this block to global memory
-    if (tid == 0) output[blockIdx.x] = sdata[0];
-}
-
-int cpu_reduction_openmp(const std::vector<int>& data) {
+void cpu_reduction_openmp(const std::vector<int>& data) {
     int sum = 0;
+
+    auto start = std::chrono::high_resolution_clock::now();
+
     #pragma omp parallel for reduction(+:sum)
     for (size_t i = 0; i < data.size(); ++i) {
         sum += data[i];
     }
-    return sum;
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "cpu runtime (openmp): " << std::chrono::duration_cast<std::chrono::microseconds>(end-start).count() << " us\n";
+    std::cout << "cpu (openmp) sum: " << sum << std::endl;
 }
 
+void thread_index_check() {
+
+  size_t block_size = 128;
+
+  std::cout << "check thread index under block_size = " << block_size << "\n";
+
+  std::cout << "thread index for reduction #1\n";
+  for(unsigned int s = 1; s < block_size; s *= 2) {
+    std::cout << "level : " << s << "\n";
+    for(unsigned int tid = 0; tid < block_size; tid++) {
+      if(tid % (2 * s) == 0) {
+        std::cout << "tid = " << tid << ", tid + s = " << tid + s << "\n";
+      }
+    }
+  }
+}
+
+// CUDA reduction version #1: interleaved addressing
+// problem: highly divergent warps, and % operator is very slow
+__global__ void reduce1(int *g_idata, int *g_odata, int N) {
+  
+  extern __shared__ int sdata[];
+
+  // each thread loads one element from global memory to shared memory
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  sdata[tid] = (i < N)? g_idata[i] : 0;
+  __syncthreads();
+
+  // do reduction in shared memory
+  // s is stride, saying the distance between the elements one thread handles
+  for(unsigned int s = 1; s < blockDim.x; s *= 2) {
+    if(tid % (2 * s) == 0) {
+      sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+  }
+
+  // write result for this block to global memory
+  if(tid == 0) {
+    g_odata[blockIdx.x] = sdata[0];
+  }
+
+}
+
+void gpu_reduction_ver1(const std::vector<int>& h_data) {
+
+  const int N = h_data.size();
+
+  int *g_idata, *g_odata;
+  CUDACHECK(cudaMalloc(&g_idata, sizeof(int) * N));
+  // g_odata's size needs to be at least (N + BLOCK_SIZE - 1) / BLOCK_SIZE)
+  // to store the partial sums from the first step
+  CUDACHECK(cudaMalloc(&g_odata, sizeof(int) * ((N + BLOCK_SIZE - 1) / BLOCK_SIZE)));
+  CUDACHECK(cudaMemcpyAsync(g_idata, h_data.data(), sizeof(int) * N, cudaMemcpyHostToDevice));
+
+  // recursively invoke kernel
+  int num_element_left = N;
+  int *input = g_idata;
+  int *output = g_odata;
+
+  auto start = std::chrono::high_resolution_clock::now();
+  while(num_element_left > 1) {
+    int grid_size = (num_element_left + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+    reduce1<<<grid_size, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(input, output, num_element_left);
+
+    num_element_left = grid_size;
+    int *temp = input;
+    input = output;
+    output = temp;
+  }
+  cudaDeviceSynchronize();
+  auto end = std::chrono::high_resolution_clock::now();
+  std::cout << "gpu runtime (ver1, no memcpy): " << std::chrono::duration_cast<std::chrono::microseconds>(end-start).count() << " us\n";
+
+  int gpu_sum = 0;
+  CUDACHECK(cudaMemcpyAsync(&gpu_sum, input, sizeof(int), cudaMemcpyDeviceToHost));
+  std::cout << "gpu (ver1) sum: " << gpu_sum << "\n";
+
+  CUDACHECK(cudaFree(g_idata));
+  CUDACHECK(cudaFree(g_odata));
+
+}
+
+// CUDA reduction version #2: use strided index and non-divergent branch 
+// problem: bank conflict 
+__global__ void reduce2(int *g_idata, int *g_odata, int N) {
+  
+  extern __shared__ int sdata[];
+
+  // each thread loads one element from global memory to shared memory
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  sdata[tid] = (i < N)? g_idata[i] : 0;
+  __syncthreads();
+
+  // do reduction in shared memory
+  // s is stride, saying the distance between the elements one thread handles
+  for(unsigned int s = 1; s < blockDim.x; s *= 2) {
+    int index = 2 * s * tid;
+    if(index < blockDim.x) {
+      sdata[index] += sdata[index + s];
+    }
+    __syncthreads();
+  }
+
+  // write result for this block to global memory
+  if(tid == 0) {
+    g_odata[blockIdx.x] = sdata[0];
+  }
+
+}
+
+void gpu_reduction_ver2(const std::vector<int>& h_data) {
+
+  const int N = h_data.size();
+
+  int *g_idata, *g_odata;
+  CUDACHECK(cudaMalloc(&g_idata, sizeof(int) * N));
+  // g_odata's size needs to be at least (N + BLOCK_SIZE - 1) / BLOCK_SIZE)
+  // to store the partial sums from the first step
+  CUDACHECK(cudaMalloc(&g_odata, sizeof(int) * ((N + BLOCK_SIZE - 1) / BLOCK_SIZE)));
+  CUDACHECK(cudaMemcpyAsync(g_idata, h_data.data(), sizeof(int) * N, cudaMemcpyHostToDevice));
+
+  // recursively invoke kernel
+  int num_element_left = N;
+  int *input = g_idata;
+  int *output = g_odata;
+
+  auto start = std::chrono::high_resolution_clock::now();
+  while(num_element_left > 1) {
+    int grid_size = (num_element_left + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+    reduce2<<<grid_size, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(input, output, num_element_left);
+
+    num_element_left = grid_size;
+    int *temp = input;
+    input = output;
+    output = temp;
+  }
+  cudaDeviceSynchronize();
+  auto end = std::chrono::high_resolution_clock::now();
+  std::cout << "gpu runtime (ver2, no memcpy): " << std::chrono::duration_cast<std::chrono::microseconds>(end-start).count() << " us\n";
+
+  int gpu_sum = 0;
+  CUDACHECK(cudaMemcpyAsync(&gpu_sum, input, sizeof(int), cudaMemcpyDeviceToHost));
+  std::cout << "gpu (ver2) sum: " << gpu_sum << "\n";
+
+  CUDACHECK(cudaFree(g_idata));
+  CUDACHECK(cudaFree(g_odata));
+
+}
+
+// CUDA reduction version #3: use sequential addressing to remove bank conflict 
+__global__ void reduce3(int *g_idata, int *g_odata, int N) {
+  
+  extern __shared__ int sdata[];
+
+  // each thread loads one element from global memory to shared memory
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  sdata[tid] = (i < N)? g_idata[i] : 0;
+  __syncthreads();
+
+  // do reduction in shared memory
+  // s is stride, saying the distance between the elements one thread handles
+  for(unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if(tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+  }
+
+  // write result for this block to global memory
+  if(tid == 0) {
+    g_odata[blockIdx.x] = sdata[0];
+  }
+
+}
+
+void gpu_reduction_ver3(const std::vector<int>& h_data) {
+
+  const int N = h_data.size();
+
+  int *g_idata, *g_odata;
+  CUDACHECK(cudaMalloc(&g_idata, sizeof(int) * N));
+  // g_odata's size needs to be at least (N + BLOCK_SIZE - 1) / BLOCK_SIZE)
+  // to store the partial sums from the first step
+  CUDACHECK(cudaMalloc(&g_odata, sizeof(int) * ((N + BLOCK_SIZE - 1) / BLOCK_SIZE)));
+  CUDACHECK(cudaMemcpyAsync(g_idata, h_data.data(), sizeof(int) * N, cudaMemcpyHostToDevice));
+
+  // recursively invoke kernel
+  int num_element_left = N;
+  int *input = g_idata;
+  int *output = g_odata;
+
+  auto start = std::chrono::high_resolution_clock::now();
+  while(num_element_left > 1) {
+    int grid_size = (num_element_left + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+    reduce3<<<grid_size, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(input, output, num_element_left);
+
+    num_element_left = grid_size;
+    int *temp = input;
+    input = output;
+    output = temp;
+  }
+  cudaDeviceSynchronize();
+  auto end = std::chrono::high_resolution_clock::now();
+  std::cout << "gpu runtime (ver3, no memcpy): " << std::chrono::duration_cast<std::chrono::microseconds>(end-start).count() << " us\n";
+
+  int gpu_sum = 0;
+  CUDACHECK(cudaMemcpyAsync(&gpu_sum, input, sizeof(int), cudaMemcpyDeviceToHost));
+  std::cout << "gpu (ver3) sum: " << gpu_sum << "\n";
+
+  CUDACHECK(cudaFree(g_idata));
+  CUDACHECK(cudaFree(g_odata));
+
+}
+
+
+
 int main() {
-    const int N = 1 << 20; // 1M elements
+    size_t step_size = 20;
+    const int N = 1 << step_size; // 1M elements
     std::vector<int> h_data(N, 1); // initialize with all ones
+    std::cout << "number of elements = " << N << "\n";
 
-    // CPU OpenMP reduction
-    int cpu_sum = cpu_reduction_openmp(h_data);
-    std::cout << "CPU (OpenMP) sum: " << cpu_sum << std::endl;
+    // CPU openmp reduction
+    cpu_reduction_openmp(h_data);
 
-    // CUDA reduction
-    int *d_input, *d_output;
-    cudaMalloc(&d_input, N * sizeof(int));
-    cudaMemcpy(d_input, h_data.data(), N * sizeof(int), cudaMemcpyHostToDevice);
+    // GPU reduction with thread divergence
+    gpu_reduction_ver1(h_data);
 
-    int threads = 256;
-    int blocks = (N + threads - 1) / threads;
-    cudaMalloc(&d_output, blocks * sizeof(int));
+    // GPU reduction with bank conflict 
+    gpu_reduction_ver2(h_data);
 
-    cuda_reduction<<<blocks, threads, threads * sizeof(int)>>>(d_input, d_output, N);
-
-    // Now d_output has "blocks" number of partial sums
-    std::vector<int> h_partial(blocks);
-    cudaMemcpy(h_partial.data(), d_output, blocks * sizeof(int), cudaMemcpyDeviceToHost);
-
-    // Final reduction on CPU
-    int gpu_sum = std::accumulate(h_partial.begin(), h_partial.end(), 0);
-    std::cout << "GPU (CUDA) sum: " << gpu_sum << std::endl;
-
-    cudaFree(d_input);
-    cudaFree(d_output);
+    // GPU reduction with sequential addressing to remove bank conflict
+    // has for loop 
+    gpu_reduction_ver3(h_data);
 
     return 0;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
