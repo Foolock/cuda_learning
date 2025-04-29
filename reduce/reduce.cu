@@ -6,6 +6,7 @@
 #include <chrono>
 
 #define BLOCK_SIZE 128 
+#define NUM_ITERS_PER_THREAD 4
 
 // handle errors in CUDA call
 #define CUDACHECK(call)                                                        \
@@ -512,6 +513,105 @@ void gpu_reduction_ver6(const std::vector<int>& h_data) {
 
 }
 
+// CUDA reduction version #6+: completely unroll for different block size
+// also make NUM_ITERS_PER_THREAD as template parameter
+// NUM_ITERS_PER_THREAD: the number of element pre-added per thread during shared memory load  
+template <unsigned int blockSize, unsigned int num_iter_per_thread>
+__global__ void reduce6_plus(int *g_idata, int *g_odata, int N) {
+  
+  extern __shared__ int sdata[];
+
+  // perform first level of reduction by loading num_iter_per_thread element from global memory 
+  unsigned int tid = threadIdx.x;
+  unsigned int idx = blockIdx.x * (blockDim.x * num_iter_per_thread) + threadIdx.x; // ×2
+  int sum = 0;
+  #pragma unroll
+  for (int i = 0; i < num_iter_per_thread; ++i) {
+    if (idx + i * blockDim.x < N) {
+      sum += g_idata[idx + i * blockDim.x];
+    }
+  }
+  sdata[tid] = sum;
+  __syncthreads();
+
+  // do reduction in shared memory
+  // s is stride, saying the distance between the elements one thread handles
+  if(blockSize >= 512) {
+    if (tid < 256) {
+      sdata[tid] += sdata[tid + 256];
+    }
+    __syncthreads();
+  }
+  if(blockSize >= 256) {
+    if (tid < 128) {
+      sdata[tid] += sdata[tid + 128];
+    }
+    __syncthreads();
+  }
+  if(blockSize >= 128) {
+    if (tid < 64) {
+      sdata[tid] += sdata[tid + 64];
+    }
+    __syncthreads();
+  }
+
+  if(tid < 32) warpReduce1<blockSize>(sdata, tid);
+
+  // write result for this block to global memory
+  if(tid == 0) {
+    g_odata[blockIdx.x] = sdata[0];
+  }
+
+}
+
+void gpu_reduction_ver6_plus(const std::vector<int>& h_data) {
+
+  const int N = h_data.size();
+
+  int *g_idata, *g_odata;
+  CUDACHECK(cudaMalloc(&g_idata, sizeof(int) * N));
+  // g_odata's size needs to be at least (N + BLOCK_SIZE - 1) / BLOCK_SIZE)
+  // to store the partial sums from the first step
+  CUDACHECK(cudaMalloc(&g_odata, sizeof(int) * ((N + BLOCK_SIZE - 1) / BLOCK_SIZE)));
+  CUDACHECK(cudaMemcpyAsync(g_idata, h_data.data(), sizeof(int) * N, cudaMemcpyHostToDevice));
+
+  // recursively invoke kernel
+  int num_element_left = N;
+  int *input = g_idata;
+  int *output = g_odata;
+
+  auto start = std::chrono::high_resolution_clock::now();
+  while(num_element_left > 1) {
+    // halve the number of blocks launched
+    // this is done by saying now one block can handle the work that is originally handled by two blocks in #3
+    int grid_size = (num_element_left + (BLOCK_SIZE * NUM_ITERS_PER_THREAD - 1)) / (BLOCK_SIZE * NUM_ITERS_PER_THREAD);; 
+    switch(BLOCK_SIZE) {
+      case 512:
+        reduce6_plus<512, NUM_ITERS_PER_THREAD><<<grid_size, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(input, output, num_element_left);
+      case 256:
+        reduce6_plus<256, NUM_ITERS_PER_THREAD><<<grid_size, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(input, output, num_element_left);
+      case 128:
+        reduce6_plus<128, NUM_ITERS_PER_THREAD><<<grid_size, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(input, output, num_element_left);
+    }
+
+    num_element_left = grid_size;
+    int *temp = input;
+    input = output;
+    output = temp;
+  }
+  cudaDeviceSynchronize();
+  auto end = std::chrono::high_resolution_clock::now();
+  std::cout << "gpu runtime (ver6+, no memcpy): " << std::chrono::duration_cast<std::chrono::microseconds>(end-start).count() << " us\n";
+
+  int gpu_sum = 0;
+  CUDACHECK(cudaMemcpyAsync(&gpu_sum, input, sizeof(int), cudaMemcpyDeviceToHost));
+  std::cout << "gpu (ver6+) sum: " << gpu_sum << "\n";
+
+  CUDACHECK(cudaFree(g_idata));
+  CUDACHECK(cudaFree(g_odata));
+
+}
+
 int main() {
     size_t step_size = 30;
     const int N = 1 << step_size; // 1M elements
@@ -544,6 +644,11 @@ int main() {
     // perform add during shared memory load
     // completely unroll for loop 
     gpu_reduction_ver6(h_data);
+
+    // GPU reduction with sequential addressing to remove bank conflict
+    // perform add during shared memory load
+    // completely unroll for loop, also added num_iter_per_thread as template parameter
+    gpu_reduction_ver6_plus(h_data);
 
     return 0;
 }
